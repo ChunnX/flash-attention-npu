@@ -99,40 +99,42 @@ static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args,
     at::Tensor meta = at::empty({bytes}, at::device(at::kPrivateUse1).dtype(at::kByte));
     args.metaOutAddr = reinterpret_cast<uint64_t>(meta.data_ptr());
 
-    c10_npu::NPUStream currentStream = c10_npu::getCurrentNPUStream();
-    c10_npu::NPUStream aicpuStream = c10_npu::getNPUStreamFromPool();
-    aclrtStream curHandle = currentStream.stream(false);
-    aclrtStream aicpuHandle = aicpuStream.stream(false);
+    aclrtStream curHandle = c10_npu::getCurrentNPUStream().stream(false);
 
-    struct MetadataEvents {
-        aclrtEvent inputReady = nullptr;
-        aclrtEvent metadataDone = nullptr;
-    };
-    static thread_local std::unordered_map<c10::DeviceIndex, MetadataEvents> eventsByDevice;
-    MetadataEvents &events = eventsByDevice[currentStream.device_index()];
-    if (events.inputReady == nullptr) {
-        ACL_CHECK(aclrtCreateEvent(&events.inputReady));
-        ACL_CHECK(aclrtCreateEvent(&events.metadataDone));
-    }
-
+    // Launch the AICPU metadata kernel as an async task via RunOpApiV2 so it goes
+    // through the same ordered task queue as the forward below; a direct host-side
+    // launch (even with aclrtSynchronizeStream) races the forward kernel on the
+    // first call in a fresh process, leaving the tiling uninitialized (all-zero
+    // output / lse=inf).
+    //
+    // On the current stream, not on a pool stream joined by a pair of events. That
+    // earlier shape recorded `inputReady` on the current stream, had the pool
+    // stream wait on it, ran the kernel there, then had the current stream wait on
+    // `metadataDone`. The order it produced was "everything already queued on the
+    // current stream -> the AICPU kernel -> everything queued after", which is what
+    // a plain launch on the current stream produces anyway: the second stream
+    // bought no concurrency, only a cross-stream fork/join.
+    //
+    // And aclgraph rejects that fork/join. Under capture the first
+    // aclrtRecordEvent fails with runtime 207000 and capture_end reports
+    // `ascendc_fa_metadata`, so any graph containing a scheduler-metadata call
+    // fails to capture -- which rules the path out for a caller whose sequence
+    // lengths live on device precisely because it is replaying a graph. A plain
+    // kernel launch on the capturing stream is what the forward already does, and
+    // it captures. Observed on Ascend910 against the v4 copy of this function,
+    // which was identical to this one line for line.
+    //
+    // The tensors are captured by value for the same reason `launch_fa_infer` keeps
+    // `seqlenk_gpu_tensor`: the deferred task can outlive this scope, and it holds
+    // raw pointers into them. They no longer need recordStream, since with the pool
+    // stream gone they are only ever used on the stream they were allocated against.
     FAMetadataArgs metaArgs = args;
-    auto metadata_task = [curHandle, aicpuHandle,
-                          inputReady = events.inputReady,
-                          metadataDone = events.metadataDone, metaArgs]() mutable -> int {
-        ACL_CHECK(aclrtRecordEvent(inputReady, curHandle));
-        ACL_CHECK(aclrtStreamWaitEvent(aicpuHandle, inputReady));
-        ComputeFAMetadata<<<1, nullptr, aicpuHandle>>>(&metaArgs, sizeof(metaArgs));
-        ACL_CHECK(aclrtRecordEvent(metadataDone, aicpuHandle));
-        ACL_CHECK(aclrtStreamWaitEvent(curHandle, metadataDone));
+    auto metadata_task = [curHandle, metaArgs, meta, seqlensK, cuSeqlensQ]() mutable -> int {
+        ComputeFAMetadata<<<1, nullptr, curHandle>>>(&metaArgs, sizeof(metaArgs));
         return 0;
     };
     at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_metadata", metadata_task);
 
-    c10_npu::NPUCachingAllocator::recordStream(meta.storage().data_ptr(), aicpuStream);
-    c10_npu::NPUCachingAllocator::recordStream(seqlensK.storage().data_ptr(), aicpuStream);
-    if (cuSeqlensQ.has_value()) {
-        c10_npu::NPUCachingAllocator::recordStream(cuSeqlensQ->storage().data_ptr(), aicpuStream);
-    }
     return meta;
 }
 
