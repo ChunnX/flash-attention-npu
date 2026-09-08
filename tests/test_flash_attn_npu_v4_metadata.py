@@ -229,6 +229,11 @@ FLASH_ATTN_VARLEN_CASES = [
     (torch.bfloat16, 5, 4, 4, 512, 512, 128, True),
     (torch.float16, 7, 5, 1, 777, 888, 192, False),
     (torch.bfloat16, 1, 1, 1, 7777, 8192, 64, True),
+    # headdim 256: the forward reads head_size from the tiling blob rather than
+    # binning it into a template, so the AICPU metadata path has to carry it the
+    # same way the host path does. Previously only covered up to 192 here.
+    (torch.bfloat16, 3, 8, 2, 256, 512, 256, False),
+    (torch.float16, 2, 4, 4, 512, 512, 256, True),
 ]
 
 
@@ -237,6 +242,7 @@ KV_CACHE_BSND_CASES = [
     (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 128, False),
     (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 128, True),
     (torch.bfloat16, 1, 1, 1, 2048, 2048, 128, 128, False),
+    (torch.bfloat16, 2, 4, 4, 512, 512, 256, 128, False),
 ]
 
 
@@ -244,6 +250,10 @@ KV_CACHE_TND_CASES = [
     # data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, block_size, is_causal
     (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 128, True),
     (torch.bfloat16, 5, 4, 4, 512, 512, 128, 128, True),
+    # headdim 256 on the paged TND path, which is the shape a parallel-drafting
+    # draft uses: short uniform query, GQA, non-causal.
+    (torch.bfloat16, 4, 8, 2, 4, 1024, 256, 128, False),
+    (torch.float16, 2, 8, 2, 16, 512, 256, 128, True),
 ]
 
 
