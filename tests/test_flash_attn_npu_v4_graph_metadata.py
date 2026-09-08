@@ -12,10 +12,13 @@ this backend has to match to replace it.
 So: capture metadata + forward together, then replay after mutating the device-side
 `cache_seqlens` in place. Three outcomes, each attributable to one test:
 
-1. capture raises -> the AICPU launch is not capturable. `GetSchedulerMetadataImpl`
-   takes a second stream from the pool and orders it with two `thread_local` events
-   via `RunOpApiV2`; if that fork/join does not propagate capture, the metadata
-   launch has to move onto the current stream instead.
+1. capture raises -> the AICPU launch is not capturable. This is what the first run
+   of this test found: `GetSchedulerMetadataImpl` ran the kernel on a pool stream
+   joined to the current one by two `thread_local` events, and under capture the
+   first `aclrtRecordEvent` failed with runtime 207000, `capture_end` naming
+   `ascendc_fa_metadata`. That fork/join produced a full serialization anyway, so it
+   was replaced by a plain launch on the current stream; this test is now the
+   regression guard for that.
 2. capture succeeds but replay is stale -> `test_replay_tracks_device_seqlens` fails
    on the B comparison. This is the dangerous outcome: no error, just capture-time
    tiling applied to new lengths.
@@ -171,9 +174,17 @@ def test_eager_metadata_matches_reference(head_size):
     assert_fa_close(output_npu, golden_ref, golden_pt, name="eager out")
 
 
-@pytest.mark.parametrize("head_size", HEAD_SIZES)
-def test_replay_tracks_device_seqlens(head_size):
+# Not parametrized over HEAD_SIZES, unlike the eager test. Capture is head-size
+# independent, and a failed capture leaves the stream stuck in capture mode for the
+# rest of the process -- a second case then dies in the autouse seeding fixture with
+# "set_current_seed can be called during stream capture only if...", which reads like
+# a second, unrelated problem. One case, one answer.
+CAPTURE_HEAD_SIZE = 256
+
+
+def test_replay_tracks_device_seqlens():
     """Capture metadata + forward, then replay against different device lengths."""
+    head_size = CAPTURE_HEAD_SIZE
     query, key_cache, value_cache, page_table, cu_seqlens_q, cache_seqlens = _make_inputs(head_size)
     seqlens_a = torch.tensor(SEQLENS_A, dtype=torch.int32).npu()
     seqlens_b = torch.tensor(SEQLENS_B, dtype=torch.int32).npu()
