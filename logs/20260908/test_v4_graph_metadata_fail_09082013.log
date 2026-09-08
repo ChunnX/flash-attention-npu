@@ -1,0 +1,161 @@
+[root@13c974345b90 flash-attention-npu]# pytest -q -s tests/test_flash_attn_npu_v4_graph_metadata.py 
+..[E908 12:10:29.834966320 OpParamMaker.cpp:454] aclrtRecordEvent(inputReady, curHandle) failed
+Exception raised from operator() at /opt/x00873006/dspark_dev/flash-attention-npu/csrc/ascend910/flash_attn_npu_4/flash_api.cpp:131 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0xc8 (0xffff96165978 in /usr/local/python3.12.13/lib/python3.12/site-packages/torch/lib/libc10.so)
+frame #1: c10::detail::torchCheckFail(char const*, char const*, unsigned int, char const*) + 0x6c (0xffff96109b8c in /usr/local/python3.12.13/lib/python3.12/site-packages/torch/lib/libc10.so)
+frame #2: <unknown function> + 0x1211a78 (0xfffd4c7d1a78 in /opt/x00873006/dspark_dev/flash-attention-npu/flash_attn_npu_4/flash_attn_npu_4.cpython-312-aarch64-linux-gnu.so)
+frame #3: <unknown function> + 0x3a27284 (0xfffde8bd7284 in /usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/lib/libtorch_npu.so)
+frame #4: <unknown function> + 0xca83a0 (0xfffde5e583a0 in /usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/lib/libtorch_npu.so)
+frame #5: <unknown function> + 0xca8f7c (0xfffde5e58f7c in /usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/lib/libtorch_npu.so)
+frame #6: <unknown function> + 0xca6e98 (0xfffde5e56e98 in /usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/lib/libtorch_npu.so)
+frame #7: <unknown function> + 0xd43cc (0xffffa50743cc in /lib64/libstdc++.so.6)
+frame #8: <unknown function> + 0x7f874 (0xffffa525f874 in /lib64/libc.so.6)
+frame #9: <unknown function> + 0xe7c8c (0xffffa52c7c8c in /lib64/libc.so.6)
+
+FE
+======================================================================================== ERRORS ========================================================================================
+_______________________________________________________________ ERROR at setup of test_replay_tracks_device_seqlens[256] _______________________________________________________________
+
+request = <SubRequest '_seed_per_case' for <Function test_replay_tracks_device_seqlens[256]>>
+
+    @pytest.fixture(autouse=True)
+    def _seed_per_case(request):
+        """Seed torch's default RNG (CPU + NPU) per test case for reproducibility.
+    
+        Default: stable distinct seed per case = crc32(pytest node id), so a failure
+        can be reproduced by re-running that exact case. Set env CI_TORCH_SEED to
+        override with one global seed for all cases (e.g. CI_TORCH_SEED=0 gives
+        torch.manual_seed(0) everywhere). Rand calls passing an explicit
+        ``generator=`` use that generator and are unaffected.
+        """
+        import torch
+        import zlib
+        env_seed = os.environ.get("CI_TORCH_SEED")
+        seed = int(env_seed) if env_seed else zlib.crc32(
+            request.node.nodeid.encode("utf-8"))
+>       torch.manual_seed(seed)
+
+tests/conftest.py:84: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/local/python3.12.13/lib/python3.12/site-packages/torch/_compile.py:54: in inner
+    return disable_fn(*args, **kwargs)
+/usr/local/python3.12.13/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py:1181: in _fn
+    return fn(*args, **kwargs)
+/usr/local/python3.12.13/lib/python3.12/site-packages/torch/random.py:42: in manual_seed
+    return _manual_seed_impl(seed)
+/usr/local/python3.12.13/lib/python3.12/site-packages/torch/random.py:62: in _manual_seed_impl
+    _seed_custom_device(seed)
+/usr/local/python3.12.13/lib/python3.12/site-packages/torch/random.py:110: in _seed_custom_device
+    getattr(custom_device_mod, _seed_all_name)(seed)
+/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/npu/random.py:116: in manual_seed_all
+    _lazy_call(cb)
+/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/npu/__init__.py:224: in _lazy_call
+    cb()
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    def cb():
+        for i in range(device_count()):
+            default_generator = torch_npu.npu.default_generators[i]
+>           default_generator.manual_seed(seed)
+E           RuntimeError: NPUGeneratorImpl::set_current_seed can be called during stream capture only if new seed is the same as the original seed.
+
+/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/npu/random.py:114: RuntimeError
+======================================================================================= FAILURES =======================================================================================
+________________________________________________________________________ test_replay_tracks_device_seqlens[128] ________________________________________________________________________
+
+head_size = 128
+
+    @pytest.mark.parametrize("head_size", HEAD_SIZES)
+    def test_replay_tracks_device_seqlens(head_size):
+        """Capture metadata + forward, then replay against different device lengths."""
+        query, key_cache, value_cache, page_table, cu_seqlens_q, cache_seqlens = _make_inputs(head_size)
+        seqlens_a = torch.tensor(SEQLENS_A, dtype=torch.int32).npu()
+        seqlens_b = torch.tensor(SEQLENS_B, dtype=torch.int32).npu()
+    
+        # Eager baselines for both length sets, taken before capture so the graph
+        # pool cannot recycle them.
+        with torch.no_grad():
+            cache_seqlens.copy_(seqlens_a)
+            eager_a = _run(
+                query, key_cache, value_cache, page_table, cu_seqlens_q, cache_seqlens, head_size
+            ).clone()
+            cache_seqlens.copy_(seqlens_b)
+            eager_b = _run(
+                query, key_cache, value_cache, page_table, cu_seqlens_q, cache_seqlens, head_size
+            ).clone()
+        torch.npu.synchronize()
+    
+        # Without this the replay comparison proves nothing: if A and B produced the
+        # same output, a graph frozen at capture-time tiling would pass anyway.
+        assert not torch.allclose(eager_a.float(), eager_b.float(), atol=1e-3), (
+            "SEQLENS_A and SEQLENS_B produce indistinguishable output; pick lengths "
+            "that actually change the result before trusting the replay assertions"
+        )
+    
+        cache_seqlens.copy_(seqlens_a)
+        torch.npu.synchronize()
+    
+        graph = torch.npu.NPUGraph()
+        with torch.no_grad():
+>           with torch.npu.graph(graph):
+
+tests/test_flash_attn_npu_v4_graph_metadata.py:206: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/npu/graphs.py:533: in __exit__
+    self.npu_graph.capture_end()
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <torch_npu.npu.graphs.NPUGraph object at 0xfffd4e4639b0>
+
+    def capture_end(self):
+        r"""End NPU graph capture on the current stream.
+    
+        After ``capture_end``, ``replay`` may be called on this instance.
+    
+        Typically, you shouldn't call ``capture_end`` yourself.
+        Use :class:`~torch.npu.graph` or :func:`~torch.npu.make_graphed_callables`,
+        which call ``capture_end`` internally.
+        """
+>       super().capture_end()
+E       RuntimeError: The Inner error is reported as above. The process exits for this inner error, and the current working operator name is ascendc_fa_metadata.
+E       Since the operator is called asynchronously, the stacktrace may be inaccurate. If you want to get the accurate stacktrace, please set the environment variable ASCEND_LAUNCH_BLOCKING=1.
+E       Note: ASCEND_LAUNCH_BLOCKING=1 will force ops to run in synchronous mode, resulting in performance degradation. Please unset ASCEND_LAUNCH_BLOCKING in time after debugging.
+E       [ERROR] 2026-09-08-12:10:29 (PID:2443629, Device:0, RankID:-1) ERR00100 PTA call acl api failed.
+E       EH9999: Inner Error!
+E       EH9999[PID: 2443629] 2026-09-08-12:10:29.194.742 (EH9999):  record event failed, runtime result = 207000[FUNC:ReportCallError][FILE:log_inner.cpp][LINE:148]
+E               TraceBack (most recent call last):
+
+/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/npu/graphs.py:370: RuntimeError
+=================================================================================== warnings summary ===================================================================================
+../../../../usr/local/python3.12.13/lib/python3.12/site-packages/torch/jit/_script.py:362: 14 warnings
+  /usr/local/python3.12.13/lib/python3.12/site-packages/torch/jit/_script.py:362: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+tests/test_flash_attn_npu_v4_graph_metadata.py::test_eager_metadata_matches_reference[128]
+  /usr/local/python3.12.13/lib/python3.12/site-packages/torch/autograd/function.py:583: UserWarning: Cannot create tensor with interal format while allow_internel_format=False, tensor will be created with base format. (Triggered internally at ../torch_npu/csrc/aten/common/TensorFactories.cpp:340.)
+    return super().apply(*args, **kwargs)  # type: ignore[misc]
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=============================================================================== short test summary info ================================================================================
+FAILED tests/test_flash_attn_npu_v4_graph_metadata.py::test_replay_tracks_device_seqlens[128] - RuntimeError: The Inner error is reported as above. The process exits for this inner error, and the current working operator name is ascendc_fa_metadata.
+ERROR tests/test_flash_attn_npu_v4_graph_metadata.py::test_replay_tracks_device_seqlens[256] - RuntimeError: NPUGeneratorImpl::set_current_seed can be called during stream capture only if new seed is the same as the original seed.
+1 failed, 2 passed, 15 warnings, 1 error in 14.79s
+[W908 12:10:29.191675330 NPUStream.cpp:596] Warning: NPU warning, error code is 107027[Error]: .
+EE9999: Inner Error!
+EE9999[PID: 2443629] 2026-09-08-12:10:29.551.635 (EE9999):  rtDeviceSynchronizeWithTimeout execution failed, reason=stream is captured[FUNC:FuncErrorReason][FILE:error_message_manage.cc][LINE:65]
+        TraceBack (most recent call last):
+       wait for compute device to finish failed, runtime result = 107027.[FUNC:ReportCallError][FILE:log_inner.cpp][LINE:148]
+ (function npuSynchronizeUsedDevices)
+[W908 12:10:29.192344530 NPUStream.cpp:578] Warning: NPU warning, error code is 107027[Error]: .
+EE9999: Inner Error!
+EE9999[PID: 2443629] 2026-09-08-12:10:29.552.533 (EE9999):  rtDeviceSynchronizeWithTimeout execution failed, reason=stream is captured[FUNC:FuncErrorReason][FILE:error_message_manage.cc][LINE:65]
+        TraceBack (most recent call last):
+       wait for compute device to finish failed, runtime result = 107027.[FUNC:ReportCallError][FILE:log_inner.cpp][LINE:148]
+ (function npuSynchronizeDevice)
+[W908 12:10:29.193389410 npu_sys_ctrl.cpp:316] Warning: NPU warning, error code is 107027[Error]: .
+EE9999: Inner Error!
+EE9999[PID: 2443629] 2026-09-08-12:10:29.553.219 (EE9999):  stream is in capture mode, stream_id=70.[FUNC:StreamDestroy][FILE:api_error.cc][LINE:984]
+        TraceBack (most recent call last):
+       rtStreamDestroyForce execution failed, reason=stream is captured[FUNC:FuncErrorReason][FILE:error_message_manage.cc][LINE:65]
+       destroy stream force failed, runtime result = 107027[FUNC:ReportCallError][FILE:log_inner.cpp][LINE:148]
+ (function operator())
