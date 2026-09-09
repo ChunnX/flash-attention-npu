@@ -60,10 +60,16 @@ BLOCK_SIZE = 128
 MAX_BLOCKS_PER_SEQ = 16
 MAX_SEQLEN_K = MAX_BLOCKS_PER_SEQ * BLOCK_SIZE  # page capacity, see module docstring
 
-# Two length sets that differ per request, both within the page capacity. Used by
-# the replay test, where what matters is only that A and B give different output.
-SEQLENS_A = [1024, 512, 900, 128]
-SEQLENS_B = [2048, 1500, 64, 777]
+# Length pairs for the replay test, where what matters is only that A and B give
+# different output. Keyed by flash-decode mode for the same reason the eager cases
+# are: if the split KV path is broken both members come back wrong, the guard below
+# fires with "indistinguishable output", and capture is never reached -- which
+# answers nothing. Sorted order runs fd_off first, so the capture question gets an
+# answer even on a build where fd_on cannot produce one.
+REPLAY_SEQLENS = {
+    "fd_off": ([900, 512, 700, 128], [700, 900, 128, 512]),
+    "fd_on": ([1024, 512, 900, 128], [2048, 1500, 64, 777]),
+}
 
 # The eager test runs both flash-decode modes. Whether the tiling turns flash
 # decode on is decided by, among other things, `maxKvSeqlen >= 1024`, and at this
@@ -220,20 +226,24 @@ def test_eager_metadata_matches_reference(fd_mode, head_size):
     assert_fa_close(output_npu, golden_ref, golden_pt, name=f"eager out ({fd_mode})")
 
 
-# Not parametrized over HEAD_SIZES, unlike the eager test. Capture is head-size
+# Not parametrized over HEAD_SIZES, unlike the eager test: capture is head-size
 # independent, and a failed capture leaves the stream stuck in capture mode for the
-# rest of the process -- a second case then dies in the autouse seeding fixture with
+# rest of the process -- a later case then dies in the autouse seeding fixture with
 # "set_current_seed can be called during stream capture only if...", which reads like
-# a second, unrelated problem. One case, one answer.
+# a second, unrelated problem. The flash-decode axis is worth that risk and the head
+# size is not, so only the former is parametrized, fd_off first.
 CAPTURE_HEAD_SIZE = 256
 
 
-def test_replay_tracks_device_seqlens():
+@pytest.mark.parametrize("fd_mode", sorted(REPLAY_SEQLENS))
+def test_replay_tracks_device_seqlens(fd_mode):
     """Capture metadata + forward, then replay against different device lengths."""
     head_size = CAPTURE_HEAD_SIZE
-    query, key_cache, value_cache, page_table, cu_seqlens_q, cache_seqlens = _make_inputs(head_size, SEQLENS_A)
-    seqlens_a = torch.tensor(SEQLENS_A, dtype=torch.int32).npu()
-    seqlens_b = torch.tensor(SEQLENS_B, dtype=torch.int32).npu()
+    lens_a, lens_b = REPLAY_SEQLENS[fd_mode]
+    print(f"\n  kv_lens={lens_a} -> {lens_b} flash_decode_predicted={_flash_decode_predicted(lens_a)}")
+    query, key_cache, value_cache, page_table, cu_seqlens_q, cache_seqlens = _make_inputs(head_size, lens_a)
+    seqlens_a = torch.tensor(lens_a, dtype=torch.int32).npu()
+    seqlens_b = torch.tensor(lens_b, dtype=torch.int32).npu()
 
     # Eager baselines for both length sets, taken before capture so the graph
     # pool cannot recycle them.
@@ -251,8 +261,11 @@ def test_replay_tracks_device_seqlens():
     # Without this the replay comparison proves nothing: if A and B produced the
     # same output, a graph frozen at capture-time tiling would pass anyway.
     assert not torch.allclose(eager_a.float(), eager_b.float(), atol=1e-3), (
-        "SEQLENS_A and SEQLENS_B produce indistinguishable output; pick lengths "
-        "that actually change the result before trusting the replay assertions"
+        f"the two {fd_mode} length sets produce indistinguishable output, so nothing "
+        "below would prove anything about capture. Either they need lengths that "
+        "actually change the result, or -- if the output is all zeros or nonsense -- "
+        "the eager cases for this flash-decode mode failed first and this is their "
+        "consequence, not a capture finding"
     )
 
     cache_seqlens.copy_(seqlens_a)
