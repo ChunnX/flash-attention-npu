@@ -34,6 +34,29 @@ memory rather than a wrong index:
 
 Same bug, differing in what the allocator happened to leave behind.
 
+## Confirmed at the shape that matters
+
+The table above is the synthetic shape the tests use. The standalone comparison
+harness reproduces it independently at Qwen3.6-27B's own topology -- 32 query
+heads over 8 KV heads, head_dim 256, paged KV, non-causal -- with every backend
+on the same inputs against the same fp32 golden:
+
+| batch | kv lengths | flash decode | fa_v3 max err | fa_v4 max err | noise floor |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 2048 | **on** | **7.043e-02** | 1.669e-04 | 1.952e-04 |
+| 2 | 256, 2048 | off | 5.977e-04 | 5.977e-04 | 6.045e-04 |
+| 4 | 256 … 2048 | off | 5.683e-04 | 5.683e-04 | 4.723e-04 |
+| 8 | 256 … 2048 | off | 6.142e-04 | 6.142e-04 | 4.782e-04 |
+
+v3's error in the flash-decode row is 360x the noise floor. Every other row has
+v3, v4, the sink operator and `npu_fused_infer_attention_score` agreeing to the
+last digit.
+
+Note which row it is. Flash decode needs `numTasks = batch * kvHeads` under
+`0.4 * blockDim`, and at 8 KV heads on a 910B4 that admits batch 1 and nothing
+else. The single failing configuration is single-request long-context -- the
+latency case speculative decoding exists to serve.
+
 ## Reproduction
 
 ```
@@ -138,6 +161,16 @@ have not measured.
 split write its partial unconditionally, or have the combine skip splits that
 did no work. The real fix, and it would close the latent v4 hole too. Kernel
 work, and it needs someone who owns that code.
+
+## Also established
+
+v3's scheduler-metadata path does capture into an NPUGraph, and replay does track
+the device-side sequence lengths -- `test_replay_tracks_device_seqlens[fd_off]`
+passes. The capture fix on this branch works for v3 as well as v4. Flash decode
+is the only thing wrong with v3 here, and it is worth separating the two: an
+earlier run had all three v3 cases failing, which looked like a capture problem
+until the flash-decode axis was split out and the replay case was given a shape
+it could reach.
 
 ## Our position
 
