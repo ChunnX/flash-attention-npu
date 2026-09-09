@@ -1,0 +1,277 @@
+[root@13c974345b90 flash-attention-npu]# pytest -q -s tests/test_flash_attn_npu_v3_graph_metadata.py 
+[W909 02:22:08.820662340 TensorFactories.cpp:340] Warning: Cannot create tensor with interal format while allow_internel_format=False, tensor will be created with base format. (function operator())
+  [DEBUG] eager out: shape=(16384,) num_bad(>0.512)=13923 num_loose(>0.5)=13923
+    max_diff=5.0 flat=3790/16384 (23.1%) actual=0.0 ref=-5.0 pt=-4.96875
+    actual[3787:3794]=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    ref   [3787:3794]=[-1.1953125, -4.8125, -1.1875, -5.0, -1.40625, 4.25, -0.09228515625]
+F  [DEBUG] eager out: shape=(32768,) num_bad(>0.469)=28232 num_loose(>0.5)=27933
+    max_diff=5.0 flat=5412/32768 (16.5%) actual=0.0 ref=5.0 pt=5.0
+    actual[5409:5416]=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    ref   [5409:5416]=[-2.390625, 2.765625, 2.84375, 5.0, -4.34375, 4.6875, -3.390625]
+FF
+======================================================================================= FAILURES =======================================================================================
+______________________________________________________________________ test_eager_metadata_matches_reference[128] ______________________________________________________________________
+
+head_size = 128
+
+    @pytest.mark.parametrize("head_size", HEAD_SIZES)
+    def test_eager_metadata_matches_reference(head_size):
+        """Eager AICPU-metadata path is correct before any graph question is asked."""
+        query, key_cache, value_cache, page_table, cu_seqlens_q, cache_seqlens = _make_inputs(head_size)
+    
+        with torch.no_grad():
+            output_npu = _run(
+                query, key_cache, value_cache, page_table, cu_seqlens_q, cache_seqlens, head_size
+            )
+        torch.npu.synchronize()
+    
+        golden_ref, golden_pt = _reference(query, key_cache, value_cache, page_table, SEQLENS_A, head_size)
+>       assert_fa_close(output_npu, golden_ref, golden_pt, name="eager out")
+
+tests/test_flash_attn_npu_v3_graph_metadata.py:180: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/common/compare.py:90: in assert_fa_close
+    _assert_fa_close(actual, ref, pt, softcap=softcap, name=name)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+actual = tensor([0., 0., 0.,  ..., 0., 0., 0.], dtype=torch.bfloat16), ref = tensor([-3.1094,  2.6719,  1.1875,  ..., -3.2656, -2.4688, -1.5938],
+       dtype=torch.bfloat16)
+pt = tensor([-3.1094,  2.6719,  1.1562,  ..., -3.2812, -2.4688, -1.5938],
+       dtype=torch.bfloat16)
+
+    def _assert_fa_close(actual, ref, pt, *, softcap=0.0, name="out"):
+        """Compare implementation results using Tri Dao's dual-reference rule.
+    
+        ``ref`` is the high-precision reference and ``pt`` is the PyTorch baseline.
+        Their maximum difference estimates the numerical error range:
+        ``max|actual - ref| <= rtol * max|pt - ref| + 2 * ULP(ref)``.
+        """
+        actual = actual.detach().cpu()
+        ref = ref.detach().cpu()
+        pt = pt.detach().cpu()
+        assert actual.shape == ref.shape == pt.shape, (
+            f"{name}: shape mismatch actual={tuple(actual.shape)} "
+            f"ref={tuple(ref.shape)} pt={tuple(pt.shape)}"
+        )
+        if actual.numel() == 0:
+            assert ref.numel() == 0 and pt.numel() == 0, f"{name}: empty shape mismatch"
+            return
+    
+        # Always reject NaNs. Compare matching infinities semantically before any
+        # subtraction because infinities cannot participate in the error metric.
+        assert not torch.isnan(actual).any(), f"{name}: actual contains NaN"
+        assert not torch.isnan(ref).any(), f"{name}: ref contains NaN"
+        assert not torch.isnan(pt).any(), f"{name}: pt contains NaN"
+    
+        actual_inf = torch.isinf(actual)
+        ref_inf = torch.isinf(ref)
+        pt_inf = torch.isinf(pt)
+        assert torch.equal(actual_inf, ref_inf), f"{name}: actual/ref inf mask mismatch"
+        assert torch.equal(pt_inf, ref_inf), f"{name}: pt/ref inf mask mismatch"
+        if ref_inf.any():
+            assert torch.equal(actual[ref_inf], ref[ref_inf]), (
+                f"{name}: actual/ref inf value mismatch"
+            )
+            assert torch.equal(pt[ref_inf], ref[ref_inf]), f"{name}: pt/ref inf value mismatch"
+    
+        # For tensors mixing finite values and infinities, compare numerical error
+        # only over the finite elements.
+        finite = torch.isfinite(ref)
+        if not finite.any():
+            return
+        actual = actual[finite]
+        ref = ref[finite]
+        pt = pt[finite]
+    
+        rtol = 3.0 if softcap != 0.0 else 2.0
+        # Compute ULP in ref's original dtype. Converting to float32 first would
+        # lose the fp16/bf16 ULP that this check must measure.
+        ulp = (ref + 0.3 - 0.3 - ref).abs().max().item()
+        diff = (actual - ref).abs()
+        max_diff = diff.max().item()
+        pt_diff = (pt - ref).abs().max().item()
+        # When both references match exactly (pt_diff=0) and ref is near zero, the
+        # tolerance above collapses to ~0 and cannot cover the implementation's own
+        # ULP noise (for example, dQ around 1e-6). Add an absolute lower bound.
+        tolerance = max(rtol * pt_diff + 2.0 * ulp, 1e-5)
+        # Temporary diagnostics: report the number of failures (isolated element
+        # versus a full row), their locations, and the surrounding window.
+        if max_diff > tolerance:
+            idx = (diff == max_diff).nonzero()
+            fi = idx[0].item()
+            num_bad = int((diff > tolerance).sum())
+            num_loose = int((diff > max(0.5, tolerance)).sum())
+            total = actual.numel()
+            lo = max(0, fi - 3)
+            hi = min(total, fi + 4)
+            print(f"  [DEBUG] {name}: shape={tuple(actual.shape)} "
+                  f"num_bad(>{tolerance:.3g})={num_bad} num_loose(>0.5)={num_loose}")
+            print(f"    max_diff={max_diff} flat={fi}/{total} ({100.0*fi/total:.1f}%) "
+                  f"actual={actual[fi].item()} ref={ref[fi].item()} pt={pt[fi].item()}")
+            print(f"    actual[{lo}:{hi}]={actual[lo:hi].tolist()}")
+            print(f"    ref   [{lo}:{hi}]={ref[lo:hi].tolist()}")
+>       assert max_diff <= tolerance, (
+            f"{name}: max|actual-ref|={max_diff} exceeds "
+            f"{rtol} * max|pt-ref|={pt_diff} + 2*ULP(ref)={2.0 * ulp} "
+            f"(softcap={softcap})"
+        )
+E       AssertionError: eager out: max|actual-ref|=5.0 exceeds 2.0 * max|pt-ref|=0.240234375 + 2*ULP(ref)=0.03125 (softcap=0.0)
+
+tests/common/compare.py:80: AssertionError
+______________________________________________________________________ test_eager_metadata_matches_reference[256] ______________________________________________________________________
+
+head_size = 256
+
+    @pytest.mark.parametrize("head_size", HEAD_SIZES)
+    def test_eager_metadata_matches_reference(head_size):
+        """Eager AICPU-metadata path is correct before any graph question is asked."""
+        query, key_cache, value_cache, page_table, cu_seqlens_q, cache_seqlens = _make_inputs(head_size)
+    
+        with torch.no_grad():
+            output_npu = _run(
+                query, key_cache, value_cache, page_table, cu_seqlens_q, cache_seqlens, head_size
+            )
+        torch.npu.synchronize()
+    
+        golden_ref, golden_pt = _reference(query, key_cache, value_cache, page_table, SEQLENS_A, head_size)
+>       assert_fa_close(output_npu, golden_ref, golden_pt, name="eager out")
+
+tests/test_flash_attn_npu_v3_graph_metadata.py:180: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/common/compare.py:90: in assert_fa_close
+    _assert_fa_close(actual, ref, pt, softcap=softcap, name=name)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+actual = tensor([0., 0., 0.,  ..., 0., 0., 0.], dtype=torch.bfloat16), ref = tensor([ 3.4844, -4.3750, -2.5781,  ...,  4.1562,  0.5391,  2.0625],
+       dtype=torch.bfloat16)
+pt = tensor([ 3.4844, -4.3750, -2.5781,  ...,  4.1250,  0.5391,  2.0625],
+       dtype=torch.bfloat16)
+
+    def _assert_fa_close(actual, ref, pt, *, softcap=0.0, name="out"):
+        """Compare implementation results using Tri Dao's dual-reference rule.
+    
+        ``ref`` is the high-precision reference and ``pt`` is the PyTorch baseline.
+        Their maximum difference estimates the numerical error range:
+        ``max|actual - ref| <= rtol * max|pt - ref| + 2 * ULP(ref)``.
+        """
+        actual = actual.detach().cpu()
+        ref = ref.detach().cpu()
+        pt = pt.detach().cpu()
+        assert actual.shape == ref.shape == pt.shape, (
+            f"{name}: shape mismatch actual={tuple(actual.shape)} "
+            f"ref={tuple(ref.shape)} pt={tuple(pt.shape)}"
+        )
+        if actual.numel() == 0:
+            assert ref.numel() == 0 and pt.numel() == 0, f"{name}: empty shape mismatch"
+            return
+    
+        # Always reject NaNs. Compare matching infinities semantically before any
+        # subtraction because infinities cannot participate in the error metric.
+        assert not torch.isnan(actual).any(), f"{name}: actual contains NaN"
+        assert not torch.isnan(ref).any(), f"{name}: ref contains NaN"
+        assert not torch.isnan(pt).any(), f"{name}: pt contains NaN"
+    
+        actual_inf = torch.isinf(actual)
+        ref_inf = torch.isinf(ref)
+        pt_inf = torch.isinf(pt)
+        assert torch.equal(actual_inf, ref_inf), f"{name}: actual/ref inf mask mismatch"
+        assert torch.equal(pt_inf, ref_inf), f"{name}: pt/ref inf mask mismatch"
+        if ref_inf.any():
+            assert torch.equal(actual[ref_inf], ref[ref_inf]), (
+                f"{name}: actual/ref inf value mismatch"
+            )
+            assert torch.equal(pt[ref_inf], ref[ref_inf]), f"{name}: pt/ref inf value mismatch"
+    
+        # For tensors mixing finite values and infinities, compare numerical error
+        # only over the finite elements.
+        finite = torch.isfinite(ref)
+        if not finite.any():
+            return
+        actual = actual[finite]
+        ref = ref[finite]
+        pt = pt[finite]
+    
+        rtol = 3.0 if softcap != 0.0 else 2.0
+        # Compute ULP in ref's original dtype. Converting to float32 first would
+        # lose the fp16/bf16 ULP that this check must measure.
+        ulp = (ref + 0.3 - 0.3 - ref).abs().max().item()
+        diff = (actual - ref).abs()
+        max_diff = diff.max().item()
+        pt_diff = (pt - ref).abs().max().item()
+        # When both references match exactly (pt_diff=0) and ref is near zero, the
+        # tolerance above collapses to ~0 and cannot cover the implementation's own
+        # ULP noise (for example, dQ around 1e-6). Add an absolute lower bound.
+        tolerance = max(rtol * pt_diff + 2.0 * ulp, 1e-5)
+        # Temporary diagnostics: report the number of failures (isolated element
+        # versus a full row), their locations, and the surrounding window.
+        if max_diff > tolerance:
+            idx = (diff == max_diff).nonzero()
+            fi = idx[0].item()
+            num_bad = int((diff > tolerance).sum())
+            num_loose = int((diff > max(0.5, tolerance)).sum())
+            total = actual.numel()
+            lo = max(0, fi - 3)
+            hi = min(total, fi + 4)
+            print(f"  [DEBUG] {name}: shape={tuple(actual.shape)} "
+                  f"num_bad(>{tolerance:.3g})={num_bad} num_loose(>0.5)={num_loose}")
+            print(f"    max_diff={max_diff} flat={fi}/{total} ({100.0*fi/total:.1f}%) "
+                  f"actual={actual[fi].item()} ref={ref[fi].item()} pt={pt[fi].item()}")
+            print(f"    actual[{lo}:{hi}]={actual[lo:hi].tolist()}")
+            print(f"    ref   [{lo}:{hi}]={ref[lo:hi].tolist()}")
+>       assert max_diff <= tolerance, (
+            f"{name}: max|actual-ref|={max_diff} exceeds "
+            f"{rtol} * max|pt-ref|={pt_diff} + 2*ULP(ref)={2.0 * ulp} "
+            f"(softcap={softcap})"
+        )
+E       AssertionError: eager out: max|actual-ref|=5.0 exceeds 2.0 * max|pt-ref|=0.21875 + 2*ULP(ref)=0.03125 (softcap=0.0)
+
+tests/common/compare.py:80: AssertionError
+__________________________________________________________________________ test_replay_tracks_device_seqlens ___________________________________________________________________________
+
+    def test_replay_tracks_device_seqlens():
+        """Capture metadata + forward, then replay against different device lengths."""
+        head_size = CAPTURE_HEAD_SIZE
+        query, key_cache, value_cache, page_table, cu_seqlens_q, cache_seqlens = _make_inputs(head_size)
+        seqlens_a = torch.tensor(SEQLENS_A, dtype=torch.int32).npu()
+        seqlens_b = torch.tensor(SEQLENS_B, dtype=torch.int32).npu()
+    
+        # Eager baselines for both length sets, taken before capture so the graph
+        # pool cannot recycle them.
+        with torch.no_grad():
+            cache_seqlens.copy_(seqlens_a)
+            eager_a = _run(
+                query, key_cache, value_cache, page_table, cu_seqlens_q, cache_seqlens, head_size
+            ).clone()
+            cache_seqlens.copy_(seqlens_b)
+            eager_b = _run(
+                query, key_cache, value_cache, page_table, cu_seqlens_q, cache_seqlens, head_size
+            ).clone()
+        torch.npu.synchronize()
+    
+        # Without this the replay comparison proves nothing: if A and B produced the
+        # same output, a graph frozen at capture-time tiling would pass anyway.
+>       assert not torch.allclose(eager_a.float(), eager_b.float(), atol=1e-3), (
+            "SEQLENS_A and SEQLENS_B produce indistinguishable output; pick lengths "
+            "that actually change the result before trusting the replay assertions"
+        )
+E       AssertionError: SEQLENS_A and SEQLENS_B produce indistinguishable output; pick lengths that actually change the result before trusting the replay assertions
+E       assert not True
+E        +  where True = <built-in method allclose of type object at 0xffff9df2be88>(tensor([[[0., 0., 0.,  ..., 0., 0., 0.],\n         [0., 0., 0.,  ..., 0., 0., 0.],\n         [0., 0., 0.,  ..., 0., 0., ...  ..., 0., 0., 0.],\n         [0., 0., 0.,  ..., 0., 0., 0.],\n         [0., 0., 0.,  ..., 0., 0., 0.]]], device='npu:0'), tensor([[[0., 0., 0.,  ..., 0., 0., 0.],\n         [0., 0., 0.,  ..., 0., 0., 0.],\n         [0., 0., 0.,  ..., 0., 0., ...  ..., 0., 0., 0.],\n         [0., 0., 0.,  ..., 0., 0., 0.],\n         [0., 0., 0.,  ..., 0., 0., 0.]]], device='npu:0'), atol=0.001)
+E        +    where <built-in method allclose of type object at 0xffff9df2be88> = torch.allclose
+E        +    and   tensor([[[0., 0., 0.,  ..., 0., 0., 0.],\n         [0., 0., 0.,  ..., 0., 0., 0.],\n         [0., 0., 0.,  ..., 0., 0., ...  ..., 0., 0., 0.],\n         [0., 0., 0.,  ..., 0., 0., 0.],\n         [0., 0., 0.,  ..., 0., 0., 0.]]], device='npu:0') = <built-in method float of Tensor object at 0xfffd4a867de0>()
+E        +      where <built-in method float of Tensor object at 0xfffd4a867de0> = tensor([[[0., 0., 0.,  ..., 0., 0., 0.],\n         [0., 0., 0.,  ..., 0., 0., 0.],\n         [0., 0., 0.,  ..., 0., 0., ...[0., 0., 0.,  ..., 0., 0., 0.],\n         [0., 0., 0.,  ..., 0., 0., 0.]]], device='npu:0',\n       dtype=torch.bfloat16).float
+E        +    and   tensor([[[0., 0., 0.,  ..., 0., 0., 0.],\n         [0., 0., 0.,  ..., 0., 0., 0.],\n         [0., 0., 0.,  ..., 0., 0., ...  ..., 0., 0., 0.],\n         [0., 0., 0.,  ..., 0., 0., 0.],\n         [0., 0., 0.,  ..., 0., 0., 0.]]], device='npu:0') = <built-in method float of Tensor object at 0xfffd4a867610>()
+E        +      where <built-in method float of Tensor object at 0xfffd4a867610> = tensor([[[0., 0., 0.,  ..., 0., 0., 0.],\n         [0., 0., 0.,  ..., 0., 0., 0.],\n         [0., 0., 0.,  ..., 0., 0., ...[0., 0., 0.,  ..., 0., 0., 0.],\n         [0., 0., 0.,  ..., 0., 0., 0.]]], device='npu:0',\n       dtype=torch.bfloat16).float
+
+tests/test_flash_attn_npu_v3_graph_metadata.py:213: AssertionError
+=================================================================================== warnings summary ===================================================================================
+../../../../usr/local/python3.12.13/lib/python3.12/site-packages/torch/jit/_script.py:362: 14 warnings
+  /usr/local/python3.12.13/lib/python3.12/site-packages/torch/jit/_script.py:362: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=============================================================================== short test summary info ================================================================================
+FAILED tests/test_flash_attn_npu_v3_graph_metadata.py::test_eager_metadata_matches_reference[128] - AssertionError: eager out: max|actual-ref|=5.0 exceeds 2.0 * max|pt-ref|=0.240234375 + 2*ULP(ref)=0.03125 (softcap=0.0)
+FAILED tests/test_flash_attn_npu_v3_graph_metadata.py::test_eager_metadata_matches_reference[256] - AssertionError: eager out: max|actual-ref|=5.0 exceeds 2.0 * max|pt-ref|=0.21875 + 2*ULP(ref)=0.03125 (softcap=0.0)
+FAILED tests/test_flash_attn_npu_v3_graph_metadata.py::test_replay_tracks_device_seqlens - AssertionError: SEQLENS_A and SEQLENS_B produce indistinguishable output; pick lengths that actually change the result before trusting the replay assertions
+3 failed, 14 warnings in 15.39s
