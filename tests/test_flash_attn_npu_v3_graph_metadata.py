@@ -60,14 +60,51 @@ BLOCK_SIZE = 128
 MAX_BLOCKS_PER_SEQ = 16
 MAX_SEQLEN_K = MAX_BLOCKS_PER_SEQ * BLOCK_SIZE  # page capacity, see module docstring
 
-# Two length sets that differ per request, both within the page capacity.
+# Two length sets that differ per request, both within the page capacity. Used by
+# the replay test, where what matters is only that A and B give different output.
 SEQLENS_A = [1024, 512, 900, 128]
 SEQLENS_B = [2048, 1500, 64, 777]
+
+# The eager test runs both flash-decode modes. Whether the tiling turns flash
+# decode on is decided by, among other things, `maxKvSeqlen >= 1024`, and at this
+# batch/head shape that is the only term that varies -- so these two sets differ
+# in nothing else. Splitting them apart is what tells a wrong answer in the split
+# KV path from a wrong answer everywhere.
+EAGER_SEQLENS = {
+    "fd_on": [1024, 512, 900, 128],
+    "fd_off": [900, 512, 700, 128],
+}
 
 HEAD_SIZES = [128, 256]
 
 
-def _make_inputs(head_size):
+def _flash_decode_predicted(kv_lens):
+    """Mirror the fdFlag predicate the tiling computes, so the log names the mode.
+
+    Reproduced from the host and AICPU tiling rather than read back out of the
+    metadata blob: decoding that blob means hand-computing the C++ alignment of
+    FAInferTilingData, which cannot be checked here. This is only a label -- a
+    wrong prediction mislabels a case, it does not change what runs.
+    """
+    try:
+        cube = torch.npu.get_stream_limit(torch.npu.current_stream())["cube_core_num"]
+    except Exception:  # the label is a convenience, not the test
+        return None
+    group = NUM_HEADS // NUM_KV_HEADS
+    num_tasks = BATCH_SIZE * NUM_KV_HEADS
+    max_kv = max(kv_lens)
+    long_seq = num_tasks <= 0.8 * cube and max_kv >= cube * 512
+    short_seq = num_tasks <= 0.4 * cube and max_kv >= 1024
+    return (
+        Q_TOKENS_PER_REQ * group <= 128
+        and Q_TOKENS_PER_REQ <= 16
+        and max_kv >= 1024
+        and min(kv_lens) > 0
+        and (long_seq or short_seq)
+    )
+
+
+def _make_inputs(head_size, kv_lens):
     total_q = BATCH_SIZE * Q_TOKENS_PER_REQ
     num_blocks = BATCH_SIZE * MAX_BLOCKS_PER_SEQ
     query = make_random_tensor((total_q, NUM_HEADS, head_size), DATA_TYPE, device="npu")
@@ -86,7 +123,7 @@ def _make_inputs(head_size):
         torch.arange(BATCH_SIZE + 1, dtype=torch.int32) * Q_TOKENS_PER_REQ
     ).npu()
     # One stable device buffer, mutated in place -- the address the graph captures.
-    cache_seqlens = torch.tensor(SEQLENS_A, dtype=torch.int32).npu()
+    cache_seqlens = torch.tensor(kv_lens, dtype=torch.int32).npu()
     return query, key_cache, value_cache, page_table, cu_seqlens_q, cache_seqlens
 
 
@@ -166,9 +203,12 @@ def _assert_matches(actual, expected, *, name, diagnosis):
 
 
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
-def test_eager_metadata_matches_reference(head_size):
+@pytest.mark.parametrize("fd_mode", sorted(EAGER_SEQLENS))
+def test_eager_metadata_matches_reference(fd_mode, head_size):
     """Eager AICPU-metadata path is correct before any graph question is asked."""
-    query, key_cache, value_cache, page_table, cu_seqlens_q, cache_seqlens = _make_inputs(head_size)
+    kv_lens = EAGER_SEQLENS[fd_mode]
+    print(f"\n  kv_lens={kv_lens} flash_decode_predicted={_flash_decode_predicted(kv_lens)}")
+    query, key_cache, value_cache, page_table, cu_seqlens_q, cache_seqlens = _make_inputs(head_size, kv_lens)
 
     with torch.no_grad():
         output_npu = _run(
@@ -176,8 +216,8 @@ def test_eager_metadata_matches_reference(head_size):
         )
     torch.npu.synchronize()
 
-    golden_ref, golden_pt = _reference(query, key_cache, value_cache, page_table, SEQLENS_A, head_size)
-    assert_fa_close(output_npu, golden_ref, golden_pt, name="eager out")
+    golden_ref, golden_pt = _reference(query, key_cache, value_cache, page_table, kv_lens, head_size)
+    assert_fa_close(output_npu, golden_ref, golden_pt, name=f"eager out ({fd_mode})")
 
 
 # Not parametrized over HEAD_SIZES, unlike the eager test. Capture is head-size
@@ -191,7 +231,7 @@ CAPTURE_HEAD_SIZE = 256
 def test_replay_tracks_device_seqlens():
     """Capture metadata + forward, then replay against different device lengths."""
     head_size = CAPTURE_HEAD_SIZE
-    query, key_cache, value_cache, page_table, cu_seqlens_q, cache_seqlens = _make_inputs(head_size)
+    query, key_cache, value_cache, page_table, cu_seqlens_q, cache_seqlens = _make_inputs(head_size, SEQLENS_A)
     seqlens_a = torch.tensor(SEQLENS_A, dtype=torch.int32).npu()
     seqlens_b = torch.tensor(SEQLENS_B, dtype=torch.int32).npu()
 
